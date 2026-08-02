@@ -323,7 +323,7 @@ class StreamedAudioResult:
     async def stream(self) -> AsyncIterator[VoiceStreamEvent]:
         """Stream the events and audio data as they're generated."""
         saw_session_end = False
-        primary_exception_active = False
+        primary_exception: BaseException | None = None
         try:
             while True:
                 event = await self._queue.get()
@@ -347,8 +347,8 @@ class StreamedAudioResult:
             self._check_errors()
             if self._stored_exception:
                 raise self._stored_exception
-        except BaseException:
-            primary_exception_active = True
+        except BaseException as exc:
+            primary_exception = exc
             raise
         finally:
             try:
@@ -368,8 +368,13 @@ class StreamedAudioResult:
                 # exception, so callers that cancel or time out stream cleanup observe the
                 # cancellation instead of a successful close.
                 if isinstance(cleanup_exception, asyncio.CancelledError) or (
-                    not primary_exception_active
+                    primary_exception is None
                 ):
+                    raise
+                # When the consumer closes right after a delivered terminal event, the
+                # injected GeneratorExit must not hide a producer/task error that surfaces
+                # during finalization; the caller observes `stream()`'s real outcome.
+                if isinstance(primary_exception, GeneratorExit) and saw_session_end:
                     raise
                 try:
                     logger.warning(
