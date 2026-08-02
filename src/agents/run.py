@@ -20,6 +20,7 @@ from .exceptions import (
 )
 from .guardrail import (
     InputGuardrailResult,
+    OutputGuardrailResult,
 )
 from .items import (
     ItemHelpers,
@@ -723,6 +724,9 @@ class AgentRunner:
                 input_guardrail_results: list[InputGuardrailResult] = (
                     list(run_state._input_guardrail_results) if run_state is not None else []
                 )
+                # Output guardrails run once, at the end of the run. Accumulate their results
+                # here so the failure handler below can report them on the raised exception.
+                output_guardrail_results: list[OutputGuardrailResult] = []
                 tool_input_guardrail_results: list[ToolInputGuardrailResult] = (
                     list(getattr(run_state, "_tool_input_guardrail_results", []))
                     if run_state is not None
@@ -797,16 +801,16 @@ class AgentRunner:
                         g for g in all_input_guardrails if not g.run_in_parallel
                     ]
                     parallel_guardrails = [g for g in all_input_guardrails if g.run_in_parallel]
-                    sequential_results: list[InputGuardrailResult] = []
                     if sandbox_runtime.enabled and sequential_guardrails:
                         # Blocking first-turn guardrails must run before sandbox prep so a tripwire
                         # can prevent session creation, startup, or live-session mutation.
                         try:
-                            sequential_results = await run_input_guardrails(
+                            await run_input_guardrails(
                                 starting_agent,
                                 sequential_guardrails,
                                 copy_input_items(original_input),
                                 context_wrapper,
+                                input_guardrail_results,
                             )
                         except InputGuardrailTripwireTriggered:
                             session_input_items_for_persistence = (
@@ -1002,12 +1006,13 @@ class AgentRunner:
                             )
 
                             if isinstance(turn_result.next_step, NextStepFinalOutput):
-                                output_guardrail_results = await run_output_guardrails(
+                                await run_output_guardrails(
                                     current_agent.output_guardrails
                                     + (run_config.output_guardrails or []),
                                     current_agent,
                                     turn_result.next_step.output,
                                     context_wrapper,
+                                    output_guardrail_results,
                                 )
                                 current_step = getattr(run_state, "_current_step", None)
                                 approvals_from_state = approvals_from_step(current_step)
@@ -1140,11 +1145,12 @@ class AgentRunner:
                             context_wrapper,
                             validated_output,
                         )
-                        output_guardrail_results = await run_output_guardrails(
+                        await run_output_guardrails(
                             current_agent.output_guardrails + (run_config.output_guardrails or []),
                             current_agent,
                             validated_output,
                             context_wrapper,
+                            output_guardrail_results,
                         )
                         current_step = getattr(run_state, "_current_step", None)
                         approvals_from_state = approvals_from_step(current_step)
@@ -1221,11 +1227,12 @@ class AgentRunner:
                         if current_turn <= 1:
                             try:
                                 if sequential_guardrails:
-                                    sequential_results = await run_input_guardrails(
+                                    await run_input_guardrails(
                                         starting_agent,
                                         sequential_guardrails,
                                         copy_input_items(original_input),
                                         context_wrapper,
+                                        input_guardrail_results,
                                     )
                             except InputGuardrailTripwireTriggered:
                                 session_input_items_for_persistence = (
@@ -1240,7 +1247,6 @@ class AgentRunner:
                                 )
                                 raise
 
-                            parallel_results: list[InputGuardrailResult] = []
                             model_task = asyncio.create_task(
                                 run_single_turn(
                                     bindings=current_bindings,
@@ -1272,10 +1278,11 @@ class AgentRunner:
                                         parallel_guardrails,
                                         copy_input_items(original_input),
                                         context_wrapper,
+                                        input_guardrail_results,
                                     )
                                 )
                                 try:
-                                    parallel_results, turn_result = await asyncio.gather(
+                                    _, turn_result = await asyncio.gather(
                                         guardrail_task,
                                         model_task,
                                     )
@@ -1310,9 +1317,6 @@ class AgentRunner:
                                     raise
                             else:
                                 turn_result = await model_task
-
-                            input_guardrail_results.extend(sequential_results)
-                            input_guardrail_results.extend(parallel_results)
                         else:
                             turn_result = await run_single_turn(
                                 bindings=current_bindings,
@@ -1448,12 +1452,13 @@ class AgentRunner:
 
                     try:
                         if isinstance(turn_result.next_step, NextStepFinalOutput):
-                            output_guardrail_results = await run_output_guardrails(
+                            await run_output_guardrails(
                                 current_agent.output_guardrails
                                 + (run_config.output_guardrails or []),
                                 current_agent,
                                 turn_result.next_step.output,
                                 context_wrapper,
+                                output_guardrail_results,
                             )
 
                             # Ensure starting_input is not None and not RunState
@@ -1595,7 +1600,7 @@ class AgentRunner:
                         last_agent=current_agent,
                         context_wrapper=context_wrapper,
                         input_guardrail_results=input_guardrail_results,
-                        output_guardrail_results=[],
+                        output_guardrail_results=output_guardrail_results,
                     )
                 raise
             finally:
@@ -1693,6 +1698,10 @@ class AgentRunner:
             except RuntimeError:
                 default_loop = policy.new_event_loop()
                 policy.set_event_loop(default_loop)
+
+        if default_loop.is_closed():
+            default_loop = policy.new_event_loop()
+            policy.set_event_loop(default_loop)
 
         # We intentionally leave the default loop open even if we had to create one above. Session
         # instances and other helpers stash loop-bound primitives between calls and expect to find

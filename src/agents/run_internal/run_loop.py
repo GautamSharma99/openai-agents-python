@@ -394,18 +394,25 @@ async def _run_output_guardrails_for_stream(
     context_wrapper: RunContextWrapper[TContext],
     streamed_result: RunResultStreaming,
 ) -> list[Any]:
+    # Recorded as each guardrail completes so a tripwire still publishes the results that
+    # already finished, mirroring the non-streamed path.
+    completed_results: list[Any] = []
     streamed_result._output_guardrails_task = asyncio.create_task(
         run_output_guardrails(
             agent.output_guardrails + (run_config.output_guardrails or []),
             agent,
             output,
             context_wrapper,
+            completed_results,
         )
     )
 
     try:
         return cast(list[Any], await streamed_result._output_guardrails_task)
     except OutputGuardrailTripwireTriggered:
+        streamed_result.output_guardrail_results = (
+            streamed_result.output_guardrail_results + completed_results
+        )
         raise
     except asyncio.CancelledError:
         raise
@@ -440,6 +447,23 @@ async def _finalize_streamed_final_output(
     await save_items(items, response_id, store_setting)
 
     streamed_result._event_queue.put_nowait(QueueCompleteSentinel())
+
+
+def _accumulate_tool_guardrail_results(
+    streamed_result: RunResultStreaming,
+    turn_result: SingleStepResult,
+) -> None:
+    """Carry a turn's tool guardrail results onto the streamed result.
+
+    The non-streaming loop extends its run-wide lists from every turn result, so the streaming
+    loop has to do the same for `RunResultStreaming` to report the guardrails that ran.
+    """
+    streamed_result.tool_input_guardrail_results = (
+        streamed_result.tool_input_guardrail_results + turn_result.tool_input_guardrail_results
+    )
+    streamed_result.tool_output_guardrail_results = (
+        streamed_result.tool_output_guardrail_results + turn_result.tool_output_guardrail_results
+    )
 
 
 async def _finalize_streamed_interruption(
@@ -851,6 +875,12 @@ async def start_streaming(
                         run_config.model_settings
                     ).store
 
+                    # The non-streaming resume path extends its run-wide lists before finalizing
+                    # but skips a resumed turn that loops back to the model, so a guardrail that
+                    # re-runs for the same tool call on resume is not counted twice.
+                    if not isinstance(turn_result.next_step, NextStepRunAgain):
+                        _accumulate_tool_guardrail_results(streamed_result, turn_result)
+
                     if isinstance(turn_result.next_step, NextStepInterruption):
                         await _finalize_streamed_interruption(
                             streamed_result=streamed_result,
@@ -1133,6 +1163,7 @@ async def start_streaming(
                 streamed_result.raw_responses = streamed_result.raw_responses + [
                     turn_result.model_response
                 ]
+                _accumulate_tool_guardrail_results(streamed_result, turn_result)
                 input_before_turn_rewrite = streamed_result.input
                 streamed_result.input = turn_result.original_input
                 if isinstance(turn_result.next_step, NextStepHandoff):

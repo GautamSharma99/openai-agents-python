@@ -294,24 +294,24 @@ class StreamedAudioResult:
         await asyncio.gather(*tasks)
 
     async def _cleanup_tasks(self) -> None:
-        self._finish_turn()
-
-        owned_tasks = list(self._tasks)
-        if self._dispatcher_task is not None:
-            owned_tasks.append(self._dispatcher_task)
-        if self.text_generation_task is not None:
-            owned_tasks.append(self.text_generation_task)
-
         current_task = asyncio.current_task()
-        tasks_to_drain = list(
-            dict.fromkeys(task for task in owned_tasks if task is not current_task)
-        )
-        for task in tasks_to_drain:
+        tasks: list[asyncio.Task[Any]] = []
+        seen: set[asyncio.Task[Any]] = set()
+        for task in [*self._tasks, self._dispatcher_task, self.text_generation_task]:
+            if task is None or task is current_task or task in seen:
+                continue
+            seen.add(task)
+            tasks.append(task)
+
+        for task in tasks:
             if not task.done():
                 task.cancel()
 
-        if tasks_to_drain:
-            await asyncio.gather(*tasks_to_drain, return_exceptions=True)
+        try:
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._finish_turn()
 
     def _check_errors(self):
         for task in self._tasks:

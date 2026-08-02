@@ -9,6 +9,10 @@ context to language models. From the official documentation:
 
 The Agents Python SDK understands multiple MCP transports. This lets you reuse existing MCP servers or build your own to expose filesystem, HTTP, or connector backed tools to an agent.
 
+!!! warning "Trust MCP servers before connecting"
+
+    MCP tools can expose data from the model context and perform actions with the credentials you provide. Connect only to servers you trust, use least-privilege credentials, keep access tokens in authorization fields or headers rather than URLs, and require approval for sensitive operations. See the [OpenAI MCP security guidance](https://developers.openai.com/api/docs/guides/tools-connectors-mcp#risks-and-safety).
+
 ## Choosing an MCP integration
 
 Before wiring an MCP server into an agent decide where the tool calls should execute and which transports you can reach. The matrix below summarises the options that the Python SDK supports.
@@ -210,7 +214,7 @@ asyncio.run(main())
 
 The constructor accepts additional options:
 
-- `client_session_timeout_seconds` controls HTTP read timeouts.
+- `client_session_timeout_seconds` controls MCP ClientSession read timeouts. Positive finite values representable by `datetime.timedelta` and at least one microsecond set a finite timeout; `None` and `0` disable it. Other values are rejected when the server is constructed.
 - `use_structured_content` toggles whether `tool_result.structured_content` is preferred over textual output.
 - `max_retry_attempts` and `retry_backoff_seconds_base` add automatic retries for `list_tools()` and `call_tool()`.
 - `tool_filter` lets you expose only a subset of tools (see [Tool filtering](#tool-filtering)).
@@ -359,7 +363,7 @@ Key behaviors:
 - Failures are tracked in `failed_servers` and `errors`.
 - Set `strict=True` to raise on the first connection failure.
 - Call `reconnect(failed_only=True)` to retry failed servers, or `reconnect(failed_only=False)` to restart all servers.
-- Use `connect_timeout_seconds`, `cleanup_timeout_seconds`, and `connect_in_parallel` to tune lifecycle behavior.
+- Set `connect_timeout_seconds`, `cleanup_timeout_seconds`, and `connect_in_parallel` to tune lifecycle behavior. Lifecycle timeouts accept positive finite seconds, or `None` to disable them, and are validated both during construction and assignment; zero is rejected because it would create an immediate deadline.
 
 ## Common server capabilities
 
