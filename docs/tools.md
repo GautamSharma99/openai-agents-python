@@ -36,7 +36,7 @@ OpenAI offers a few built-in tools when using the [`OpenAIResponsesModel`][agent
 
 Advanced hosted search options:
 
--   `FileSearchTool` supports `filters`, `ranking_options`, and `include_search_results` in addition to `vector_store_ids` and `max_num_results`.
+-   `FileSearchTool` supports `filters`, `ranking_options`, and `include_search_results` in addition to `vector_store_ids` and `max_num_results`. Set `max_num_results` to an integer from 1 through 50; `None` or zero uses the provider default.
 -   `WebSearchTool` supports `filters`, `user_location`, and `search_context_size`.
 
 ```python
@@ -239,6 +239,8 @@ Local runtime tools require you to supply implementations:
 -   [`ApplyPatchTool`][agents.tool.ApplyPatchTool]: implement [`ApplyPatchEditor`][agents.editor.ApplyPatchEditor] to apply diffs locally.
 -   Local shell skills are available with `ShellTool(environment={"type": "local", "skills": [...]})`.
 
+Shell action timeouts use positive integer milliseconds for a finite timeout. The SDK treats both `0` and `None` as no explicit timeout before calling a local `ShellTool` executor because zero does not have a portable meaning across executor implementations; other values are rejected before executor invocation. This is specific to the timeout field: `max_output_length=0` remains a supported request for empty captured output.
+
 ### ComputerTool and the Responses computer tool
 
 `ComputerTool` is still a local harness: you provide a [`Computer`][agents.computer.Computer] or [`AsyncComputer`][agents.computer.AsyncComputer] implementation, and the SDK maps that harness onto the OpenAI Responses API computer surface.
@@ -306,6 +308,8 @@ You can use any Python function as a tool. The Agents SDK will set up the tool a
 -   Tool description will be taken from the docstring of the function (or you can provide a description)
 -   The schema for the function inputs is automatically created from the function's arguments
 -   Descriptions for each input are taken from the docstring of the function, unless disabled
+
+Tools created by `@tool` expose the original Python callable through the read-only `__wrapped__` attribute. This is useful for inspection and testing, but calling it directly bypasses the tool runtime pipeline, including schema validation, context injection, guardrails, timeouts, failure handling, and tracing. Hand-built `FunctionTool` instances do not expose `__wrapped__`.
 
 We use Python's `inspect` module to extract the function signature, along with [`griffe`](https://mkdocstrings.github.io/griffe/) to parse docstrings and `pydantic` for schema creation.
 

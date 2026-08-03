@@ -121,8 +121,14 @@ async def run_input_guardrails(
     guardrails: list[InputGuardrail[TContext]],
     input: str | list[TResponseInputItem],
     context: RunContextWrapper[TContext],
+    results_sink: list[InputGuardrailResult] | None = None,
 ) -> list[InputGuardrailResult]:
-    """Run input guardrails concurrently and raise on tripwires."""
+    """Run input guardrails concurrently and raise on tripwires.
+
+    Results are recorded into ``results_sink`` as each guardrail completes, including the
+    tripping result, so callers can report them even when this function raises. The streamed
+    path publishes the same results through `RunResultStreaming.input_guardrail_results`.
+    """
     if not guardrails:
         return []
 
@@ -133,10 +139,16 @@ async def run_input_guardrails(
 
     guardrail_results: list[InputGuardrailResult] = []
 
+    def record(result: InputGuardrailResult) -> None:
+        guardrail_results.append(result)
+        if results_sink is not None:
+            results_sink.append(result)
+
     try:
         for done in asyncio.as_completed(guardrail_tasks):
             result = await done
             if result.output.tripwire_triggered:
+                record(result)
                 for t in guardrail_tasks:
                     t.cancel()
                 await asyncio.gather(*guardrail_tasks, return_exceptions=True)
@@ -147,7 +159,7 @@ async def run_input_guardrails(
                     )
                 )
                 raise InputGuardrailTripwireTriggered(result)
-            guardrail_results.append(result)
+            record(result)
     except BaseException:
         # On any error (including a guardrail raising or the caller being cancelled),
         # cancel and await siblings so they don't leak past this function's return.
@@ -165,8 +177,14 @@ async def run_output_guardrails(
     agent: Agent[TContext],
     agent_output: Any,
     context: RunContextWrapper[TContext],
+    results_sink: list[OutputGuardrailResult] | None = None,
 ) -> list[OutputGuardrailResult]:
-    """Run output guardrails in parallel and raise on tripwires."""
+    """Run output guardrails in parallel and raise on tripwires.
+
+    Results are recorded into ``results_sink`` as each guardrail completes, including the
+    tripping result, so callers can report them even when this function raises. This mirrors
+    `run_input_guardrails`.
+    """
     if not guardrails:
         return []
 
@@ -177,10 +195,16 @@ async def run_output_guardrails(
 
     guardrail_results: list[OutputGuardrailResult] = []
 
+    def record(result: OutputGuardrailResult) -> None:
+        guardrail_results.append(result)
+        if results_sink is not None:
+            results_sink.append(result)
+
     try:
         for done in asyncio.as_completed(guardrail_tasks):
             result = await done
             if result.output.tripwire_triggered:
+                record(result)
                 for t in guardrail_tasks:
                     t.cancel()
                 await asyncio.gather(*guardrail_tasks, return_exceptions=True)
@@ -191,7 +215,7 @@ async def run_output_guardrails(
                     )
                 )
                 raise OutputGuardrailTripwireTriggered(result)
-            guardrail_results.append(result)
+            record(result)
     except BaseException:
         # On any error (including a guardrail raising or the caller being cancelled),
         # cancel and await siblings so they don't leak past this function's return.

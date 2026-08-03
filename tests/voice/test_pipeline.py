@@ -283,6 +283,57 @@ async def test_streamed_audio_result_propagates_cancellation_during_session_end_
         await asyncio.gather(producer_task, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_streamed_audio_result_surfaces_producer_error_on_close_after_session_end() -> None:
+    """Closing the consumer right after `session_ended` must surface a producer error that
+    surfaces during finalization, not report a clean close."""
+
+    result = StreamedAudioResult(
+        FakeTTS(),
+        TTSModelSettings(),
+        VoicePipelineConfig(),
+    )
+    producer_started = asyncio.Event()
+    producer_release = asyncio.Event()
+    producer_error = RuntimeError("producer-failed-after-terminal")
+
+    async def produce_session() -> None:
+        producer_started.set()
+        try:
+            await producer_release.wait()
+        except asyncio.CancelledError:
+            raise
+        raise producer_error
+
+    producer_task = asyncio.create_task(produce_session())
+    result._set_task(producer_task)
+    await producer_started.wait()
+    await result._queue.put(VoiceStreamEventLifecycle(event="session_ended"))
+
+    stream = cast(AsyncGenerator[VoiceStreamEvent, None], result.stream())
+    event = await anext(stream)
+    assert isinstance(event, VoiceStreamEventLifecycle)
+    assert event.event == "session_ended"
+
+    # aclose() blocks in the finally awaiting asyncio.shield(text_generation_task). When the
+    # producer then fails, `stream()` is the terminal error boundary, so the failure must
+    # propagate out of aclose() instead of being swallowed as a cleanup failure.
+    close_task = asyncio.create_task(stream.aclose())
+    try:
+        await asyncio.sleep(0)
+        assert not close_task.done()
+        producer_release.set()
+        with pytest.raises(RuntimeError, match="producer-failed-after-terminal"):
+            await asyncio.wait_for(close_task, timeout=1)
+    finally:
+        producer_release.set()
+        if not close_task.done():
+            close_task.cancel()
+        if not producer_task.done():
+            producer_task.cancel()
+        await asyncio.gather(close_task, producer_task, return_exceptions=True)
+
+
 def test_voice_pipeline_config_normalizes_dictionary_settings() -> None:
     config = VoicePipelineConfig(
         stt_settings={"language": "ja", "temperature": 0.0},
@@ -471,6 +522,51 @@ async def test_streamed_audio_dispatcher_handles_stream_failure() -> None:
         if isinstance(event, VoiceStreamEventLifecycle) and event.event == "session_ended"
     ]
     assert len(terminal_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_voice_pipeline_awaits_task_cleanup_after_tts_failure() -> None:
+    """A public pipeline stream must await sibling task cleanup when TTS fails."""
+
+    second_segment_started = asyncio.Event()
+    second_segment_stopped = asyncio.Event()
+
+    class FailingTTS(FakeTTS):
+        async def run(self, text: str, settings: TTSModelSettings):
+            del settings
+            if text == "first":
+                await second_segment_started.wait()
+                raise RuntimeError("tts-failure")
+                yield b""  # pragma: no cover
+
+            second_segment_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                second_segment_stopped.set()
+
+    def split_immediately(text: str) -> tuple[str, str]:
+        return text, ""
+
+    pipeline = VoicePipeline(
+        workflow=FakeWorkflow([["first", "second"]]),
+        stt_model=FakeSTT(["user input"]),
+        tts_model=FailingTTS(),
+        config=VoicePipelineConfig(tts_settings=TTSModelSettings(text_splitter=split_immediately)),
+    )
+    result = await pipeline.run(AudioInput(buffer=np.zeros(2, dtype=np.int16)))
+
+    with pytest.raises(RuntimeError, match="tts-failure"):
+        async for _event in result.stream():
+            pass
+
+    assert second_segment_stopped.is_set()
+    assert all(task.done() for task in result._tasks)
+    assert result._dispatcher_task is not None
+    assert result._dispatcher_task.done()
+    assert result._tracing_span is None
+    assert result.text_generation_task is not None
+    assert result.text_generation_task.done()
 
 
 @pytest.mark.asyncio
